@@ -1,0 +1,20 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Build files
+*.bin
+*.elf
+*.map
+*.hex
+
+# VS Code (auto-generated, machine-specific)
+.vscode/c_cpp_properties.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
