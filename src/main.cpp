@@ -91,7 +91,13 @@ static bool baudLocked = false;
 static uint8_t baudCandidateIdx = 0;
 static uint32_t baudWindowStartMs = 0;
 static uint8_t baudValidCount = 0;
-static uint32_t lastDataMs = 0;
+// Updated only when a structurally plausible NMEA line comes in (not on
+// every raw byte): if the source's baud rate changes while it keeps
+// transmitting, the UART still receives a continuous stream of garbled
+// bytes, so byte-level "silence" never happens and a byte-based timeout
+// would never re-scan. Going stale on *valid-looking lines* instead catches
+// that case too, not just an actually-quiet bus.
+static uint32_t lastValidLineMs = 0;
 static char lineBuf[96];
 static uint8_t lineLen = 0;
 
@@ -413,7 +419,7 @@ static void startBaudCandidate(uint8_t idx) {
 
 static void lockBaud() {
   baudLocked = true;
-  lastDataMs = millis();
+  lastValidLineMs = millis();
   uint32_t baud = BAUD_CANDIDATES[baudCandidateIdx];
   Serial.printf("Locked at %lu baud\n", (unsigned long)baud);
   rowCount = 0;
@@ -447,6 +453,7 @@ static void tickBaudDetection() {
 static void processLine(const char *line, uint8_t len) {
   if (len < 6) return;
   if (line[0] != '$' && line[0] != '!') return;
+  lastValidLineMs = millis(); // structurally plausible: counts as "still receiving real NMEA"
 
   char id[3] = { line[1], line[2], '\0' };
   char type[4] = { line[3], line[4], line[5], '\0' };
@@ -525,7 +532,6 @@ void loop() {
 
   while (gpsSerial.available()) {
     char c = gpsSerial.read();
-    lastDataMs = millis();
     if (c == '\n') {
       processLine(lineBuf, lineLen);
       lineLen = 0;
@@ -542,8 +548,9 @@ void loop() {
 
   checkLayoutSettle();
 
-  // Bus gone quiet for a while: the source may have changed baud, re-scan.
-  if (millis() - lastDataMs >= BAUD_SILENCE_RESCAN_MS) {
+  // No valid-looking line in a while — either the bus went quiet or the
+  // source's baud rate changed and it's all garbled now. Either way, re-scan.
+  if (millis() - lastValidLineMs >= BAUD_SILENCE_RESCAN_MS) {
     baudLocked = false;
     startBaudCandidate(0);
   }
