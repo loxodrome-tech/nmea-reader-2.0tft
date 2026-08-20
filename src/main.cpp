@@ -18,7 +18,8 @@
   Radar, Sounder, Weather, Xducer) currently speaking on the bus, classified
   from the sentence formatter (falling back to the talker ID for unlisted
   formatters). A category drops off the list a few seconds after it stops
-  transmitting — only sensors actually being detected are shown.
+  transmitting — only sensors actually being detected are shown. This
+  version only shows which categories are present, not their sentences.
 
   The UART baud rate isn't fixed: at boot (and if the bus ever goes fully
   quiet) it cycles through the common NMEA 0183 rates, listening for lines
@@ -68,7 +69,6 @@
 // How long without a sentence from a category before it's dropped from the list
 #define SENSOR_TIMEOUT_MS  3000
 #define MAX_SENSORS  11
-#define MAX_TYPES_PER_SENSOR  9  // GPS alone can send GGA/RMC/GLL/VTG/GSA/GSV/ZDA/GNS/DTM
 #define ROW_Y0  34
 #define ROW_H_MIN  18   // compact rows once many sensors are listed at once
 #define ROW_H_MAX  56   // how tall a row is allowed to grow when few sensors are listed
@@ -143,8 +143,6 @@ static const TalkerInfo TALKER_CATEGORY[] = {
 struct SensorRow {
   const char *category;
   uint32_t lastSeen;
-  char types[MAX_TYPES_PER_SENSOR][4];    // every distinct sentence type seen so far (e.g. "RMC")
-  uint8_t typeCount;
 };
 
 static SensorRow rows[MAX_SENSORS];
@@ -263,10 +261,9 @@ static const char *const ALL_CATEGORIES[] = {
   CAT_RADAR, CAT_SOUNDER, CAT_WEATHER, CAT_XDUCER, CAT_UNKNOWN,
 };
 
-// The character budget a row needs if its sentence list ever fills up to the
-// cap. Fixed for the life of the program — it doesn't depend on what's
-// actually been received — so sizing never has to shrink again as more
-// sentence types trickle in after a category first appears.
+// The character budget a row needs: just the longest possible category name.
+// Fixed for the life of the program, so every row shares one size and it
+// never has to change just because a row's own name happens to be shorter.
 static int16_t worstCaseChars() {
   static int16_t cached = -1;
   if (cached >= 0) return cached;
@@ -275,7 +272,7 @@ static int16_t worstCaseChars() {
     int16_t len = strlen(ALL_CATEGORIES[i]);
     if (len > maxNameLen) maxNameLen = len;
   }
-  cached = maxNameLen + 2 + (MAX_TYPES_PER_SENSOR * 3 + (MAX_TYPES_PER_SENSOR - 1) * 2);
+  cached = maxNameLen;
   return cached;
 }
 
@@ -308,33 +305,7 @@ static void refreshLayoutMetrics() {
   gDotR = dotRadiusFor[1];
 }
 
-// x where the yellow sentence-type list starts on row i, right after "Category: ".
-static int16_t rowTypesX(uint8_t i) {
-  int16_t textX = gDotR * 2 + 12;
-  return textX + gFontSize * 6 * (strlen(rows[i].category) + 2);
-}
-
-// Redraws only the yellow sentence-type list on row i (not the dot or the
-// category name, which never change once the row is laid out) — used when
-// a sensor's list simply grows, so the visible flicker is limited to that
-// small region instead of the whole row.
-static void drawRowTypes(uint8_t i) {
-  int16_t y = ROW_Y0 + i * gRowH;
-  int16_t textY = y + (gRowH - gFontSize * 8) / 2;
-  int16_t typesX = rowTypesX(i);
-
-  tft.fillRect(typesX, y, tft.width() - typesX, gRowH, ST77XX_BLACK);
-  tft.setTextSize(gFontSize);
-  tft.setTextColor(ST77XX_YELLOW);
-  tft.setCursor(typesX, textY);
-  for (uint8_t t = 0; t < rows[i].typeCount; t++) {
-    if (t > 0) tft.print(", ");
-    tft.print(rows[i].types[t]);
-  }
-}
-
-// Row layout, one line per sensor: [dot] Category: RMC, GGA, VTG, ...
-// (every sentence type seen so far, kept while the category stays listed)
+// Row layout, one line per sensor: [dot] Category
 static void drawRow(uint8_t i) {
   int16_t y = ROW_Y0 + i * gRowH;
   int16_t textX = gDotR * 2 + 12;
@@ -347,13 +318,6 @@ static void drawRow(uint8_t i) {
   tft.setCursor(textX, textY);
   tft.setTextColor(ST77XX_WHITE);
   tft.print(rows[i].category);
-  tft.print(": ");
-
-  tft.setTextColor(ST77XX_YELLOW);
-  for (uint8_t t = 0; t < rows[i].typeCount; t++) {
-    if (t > 0) tft.print(", ");
-    tft.print(rows[i].types[t]);
-  }
 }
 
 static int8_t findRow(const char *category) {
@@ -389,30 +353,6 @@ static void redrawAllRows() {
     tft.fillRect(0, ROW_Y0 + occupiedH, tft.width(), prevOccupiedH - occupiedH, ST77XX_BLACK);
   }
   prevOccupiedH = occupiedH;
-}
-
-// Records a new sentence type on a row (if it's actually new) without
-// drawing anything. Returns whether the list grew.
-static bool addTypeSilently(uint8_t i, const char *type) {
-  for (uint8_t t = 0; t < rows[i].typeCount; t++) {
-    if (strcmp(rows[i].types[t], type) == 0) return false; // already known
-  }
-  if (rows[i].typeCount >= MAX_TYPES_PER_SENSOR) return false; // list full, keep what we have
-  strcpy(rows[i].types[rows[i].typeCount], type);
-  rows[i].typeCount++;
-  return true;
-}
-
-// Adds a sentence type to the sensor's list if it hasn't been seen before.
-// Layout is sized for the worst case up front (see worstCaseChars()), so a
-// row's list growing never changes the shared size — only that one row
-// needs to repaint, and the rest of the screen stays completely still.
-// While a layout resize is pending (see layoutPending), skips drawing: this
-// row's position/size may be about to change, and the settle redraw will
-// paint it correctly once things quiet down.
-static void addSentenceType(uint8_t i, const char *type) {
-  bool grew = addTypeSilently(i, type);
-  if (grew && !layoutPending) drawRowTypes(i);
 }
 
 static void removeRowAt(uint8_t idx) {
@@ -517,7 +457,6 @@ static void processLine(const char *line, uint8_t len) {
     if (rowCount >= MAX_SENSORS) return; // list full, ignore new categories for now
     idx = rowCount++;
     rows[idx].category = category;
-    rows[idx].typeCount = 0;
     // Don't resize/redraw right now: several sensors often show up within
     // the same second, and resizing after each one would visibly grow the
     // rows and shrink them back down repeatedly. Wait for a quiet moment.
@@ -526,7 +465,6 @@ static void processLine(const char *line, uint8_t len) {
   }
 
   rows[idx].lastSeen = millis();
-  addSentenceType(idx, type);
 }
 
 // Drops any category that's gone quiet, so only currently-detected sensors stay listed.
