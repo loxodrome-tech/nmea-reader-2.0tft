@@ -18,8 +18,19 @@
   Radar, Sounder, Weather, Xducer) currently speaking on the bus, classified
   from the sentence formatter (falling back to the talker ID for unlisted
   formatters). A category drops off the list a few seconds after it stops
-  transmitting — only sensors actually being detected are shown. This
-  version only shows which categories are present, not their sentences.
+  transmitting — only sensors actually being detected are shown.
+
+  A rotary encoder scrolls a highlighted selection up/down the list. A short
+  click opens a detail screen for the selected sensor, showing every
+  distinct sentence type it's currently sending (one drops off on its own a
+  few seconds after it stops arriving); click again to return to the list.
+  A long press (from the list) opens a live console of the raw NMEA lines
+  as they arrive, on the TFT itself; a short click there pauses/resumes it
+  (it keeps buffering underneath while paused), and a long press returns
+  to the list.
+
+  Encoder wiring (KY-040 style module):
+    CLK -> GPIO32, DT -> GPIO33, SW -> GPIO4, + -> 3.3V, GND -> GND
 
   The UART baud rate isn't fixed: at boot (and if the bus ever goes fully
   quiet) it cycles through the common NMEA 0183 rates, listening for lines
@@ -62,6 +73,16 @@
 #define GPS_TX_PIN  17
 #endif
 
+#ifndef ENC_CLK_PIN
+#define ENC_CLK_PIN  32
+#endif
+#ifndef ENC_DT_PIN
+#define ENC_DT_PIN   33
+#endif
+#ifndef ENC_SW_PIN
+#define ENC_SW_PIN   4
+#endif
+
 #define PIN_MISO  -1    // the display doesn't use it
 #define TFT_W    240    // panel's native resolution (portrait)
 #define TFT_H    320
@@ -69,9 +90,16 @@
 // How long without a sentence from a category before it's dropped from the list
 #define SENSOR_TIMEOUT_MS  3000
 #define MAX_SENSORS  11
+#define MAX_TYPES_PER_SENSOR  9  // GPS alone can send GGA/RMC/GLL/VTG/GSA/GSV/ZDA/GNS/DTM
 #define ROW_Y0  34
 #define ROW_H_MIN  18   // compact rows once many sensors are listed at once
 #define ROW_H_MAX  56   // how tall a row is allowed to grow when few sensors are listed
+
+// Encoder button: how long a hold counts as a long press (opens the raw
+// console), and the minimum hold time for a release to count as a real
+// short click rather than contact bounce.
+#define LONG_PRESS_MS  800
+#define SW_DEBOUNCE_MS  30
 
 // Baud auto-detect: how long to listen on each candidate rate, how many
 // checksum-valid lines are needed to trust it, and how long the bus has to
@@ -149,10 +177,41 @@ static const TalkerInfo TALKER_CATEGORY[] = {
 struct SensorRow {
   const char *category;
   uint32_t lastSeen;
+  char types[MAX_TYPES_PER_SENSOR][4];       // distinct sentence types currently being received (e.g. "RMC")
+  uint32_t typeLastSeen[MAX_TYPES_PER_SENSOR]; // when each one last arrived, to expire it individually
+  uint8_t typeCount;
 };
 
 static SensorRow rows[MAX_SENSORS];
 static uint8_t rowCount = 0;
+
+// Rotary encoder: rotating moves the highlighted row in the list; a short
+// click opens/closes a detail screen for the selected sensor's sentence
+// types; a long press (from the list) opens a live raw-NMEA console.
+enum ViewMode { VIEW_LIST, VIEW_DETAIL, VIEW_CONSOLE };
+static ViewMode currentView = VIEW_LIST;
+static uint8_t selectedRow = 0;
+static const char *detailCategory = nullptr; // which category the detail screen is showing
+
+// Full quadrature decode (both pins, on every edge) instead of sampling DT
+// only on CLK's falling edge — the single-edge method missed or mis-read
+// steps at speed because DT isn't guaranteed to have settled yet when the
+// ISR for CLK fires. This table only accumulates at genuine transitions, so
+// contact bounce mostly cancels out. Written only from the ISR; read/cleared
+// from loop() with interrupts held off.
+static volatile int8_t encDelta = 0;
+static volatile uint8_t encRawState = 0;
+static const int8_t ENC_TABLE[16] = {
+  0, -1, 1, 0,
+  1, 0, 0, -1,
+  -1, 0, 0, 1,
+  0, 1, -1, 0,
+};
+
+void IRAM_ATTR onEncoderChange() {
+  encRawState = (encRawState << 2) | (digitalRead(ENC_CLK_PIN) << 1) | digitalRead(ENC_DT_PIN);
+  encDelta += ENC_TABLE[encRawState & 0x0F];
+}
 
 // How long to wait, after the last sensor was added/removed, before actually
 // resizing the rows to fit the new count. Several sensors often get detected
@@ -311,7 +370,8 @@ static void refreshLayoutMetrics() {
   gDotR = dotRadiusFor[1];
 }
 
-// Row layout, one line per sensor: [dot] Category
+// Row layout, one line per sensor: [dot] Category, with a border around the
+// row the encoder currently has highlighted.
 static void drawRow(uint8_t i) {
   int16_t y = ROW_Y0 + i * gRowH;
   int16_t textX = gDotR * 2 + 12;
@@ -324,6 +384,11 @@ static void drawRow(uint8_t i) {
   tft.setCursor(textX, textY);
   tft.setTextColor(ST77XX_WHITE);
   tft.print(rows[i].category);
+
+  if (i == selectedRow) {
+    tft.drawRect(1, y + 1, tft.width() - 2, gRowH - 2, ST77XX_CYAN);
+    tft.drawRect(0, y, tft.width(), gRowH, ST77XX_CYAN);
+  }
 }
 
 static int8_t findRow(const char *category) {
@@ -345,6 +410,8 @@ static int16_t prevOccupiedH = 0;
 // itself, so there's no full-screen blank frame — any area left over from a
 // taller previous layout is blanked separately, after the new rows are painted.
 static void redrawAllRows() {
+  if (selectedRow >= rowCount) selectedRow = rowCount > 0 ? rowCount - 1 : 0;
+
   if (rowCount == 0) {
     clearContentArea();
     prevOccupiedH = 0;
@@ -359,6 +426,143 @@ static void redrawAllRows() {
     tft.fillRect(0, ROW_Y0 + occupiedH, tft.width(), prevOccupiedH - occupiedH, ST77XX_BLACK);
   }
   prevOccupiedH = occupiedH;
+}
+
+// Records a sentence type as currently received: refreshes its timestamp if
+// already known, or adds it if new. Doesn't draw anything — the list view
+// doesn't show it; only the detail screen does, and only when it's the one
+// currently open. Returns whether the list actually grew (a new entry).
+static bool addTypeSilently(uint8_t i, const char *type) {
+  for (uint8_t t = 0; t < rows[i].typeCount; t++) {
+    if (strcmp(rows[i].types[t], type) == 0) {
+      rows[i].typeLastSeen[t] = millis();
+      return false; // already known, just refreshed
+    }
+  }
+  if (rows[i].typeCount >= MAX_TYPES_PER_SENSOR) return false; // list full, keep what we have
+  strcpy(rows[i].types[rows[i].typeCount], type);
+  rows[i].typeLastSeen[rows[i].typeCount] = millis();
+  rows[i].typeCount++;
+  return true;
+}
+
+// Drops any sentence type on row i that hasn't arrived in a while — a
+// sensor can keep transmitting overall while one of its formatters stops
+// (e.g. GSA turned off in a simulator), and that shouldn't linger forever
+// in its detail view. Returns whether anything was dropped.
+static bool pruneStaleTypes(uint8_t i) {
+  uint32_t now = millis();
+  bool removedAny = false;
+  for (uint8_t t = 0; t < rows[i].typeCount; ) {
+    if (now - rows[i].typeLastSeen[t] >= SENSOR_TIMEOUT_MS) {
+      for (uint8_t k = t; k < rows[i].typeCount - 1; k++) {
+        strcpy(rows[i].types[k], rows[i].types[k + 1]);
+        rows[i].typeLastSeen[k] = rows[i].typeLastSeen[k + 1];
+      }
+      rows[i].typeCount--;
+      removedAny = true;
+    } else {
+      t++;
+    }
+  }
+  return removedAny;
+}
+
+// Full-screen detail for one sensor: its name and every distinct sentence
+// type seen from it so far. Redrawn from scratch each time it's shown or
+// its list grows — there's only one row on screen here, so no need for the
+// partial-redraw tricks the list view uses.
+static void drawDetailView(uint8_t idx) {
+  clearContentArea();
+
+  tft.fillCircle(300, 48, 8, ST77XX_GREEN);
+  tft.setTextSize(3);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(8, 40);
+  tft.print(rows[idx].category);
+
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(8, 76);
+  tft.print("Sentences received:");
+
+  int16_t x = 8, y = 96;
+  const int16_t maxX = tft.width() - 8;
+  const int16_t lineH = 22;
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_YELLOW);
+  for (uint8_t t = 0; t < rows[idx].typeCount; t++) {
+    String token = (t > 0 ? String(", ") : String("")) + rows[idx].types[t];
+    int16_t w = token.length() * 12;
+    if (x != 8 && x + w > maxX) {
+      x = 8;
+      y += lineH;
+    }
+    tft.setCursor(x, y);
+    tft.print(token);
+    x += w;
+  }
+  if (rows[idx].typeCount == 0) {
+    tft.setCursor(8, y);
+    tft.print("(none yet)");
+  }
+
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(8, tft.height() - 14);
+  tft.print("Click the encoder to go back");
+
+  // The detail screen uses far more of the content area than the list
+  // usually does. Recording that as the "previously occupied" height means
+  // the next redrawAllRows() (when going back to the list) will blank all
+  // the way down to here, instead of leaving leftover detail text below
+  // wherever the list's rows happen to end this time.
+  prevOccupiedH = tft.height() - 32;
+}
+
+// Rolling history of the last raw NMEA lines, for the on-screen console.
+// Truncated to what fits the screen width — the full untruncated line is
+// still available over USB serial for anyone who needs it complete.
+#define CONSOLE_LINES     12
+#define CONSOLE_LINE_LEN  50
+static char consoleBuf[CONSOLE_LINES][CONSOLE_LINE_LEN + 1];
+static uint8_t consoleCount = 0;
+static bool consoleDirty = false;  // set when a new line arrives; drives a throttled redraw
+static bool consolePaused = false; // frozen for reading; lines keep buffering underneath
+
+static void pushConsoleLine(const char *line, uint8_t len) {
+  if (consoleCount < CONSOLE_LINES) {
+    consoleCount++;
+  } else {
+    for (uint8_t i = 0; i < CONSOLE_LINES - 1; i++) {
+      memcpy(consoleBuf[i], consoleBuf[i + 1], sizeof(consoleBuf[i]));
+    }
+  }
+  uint8_t copyLen = len < CONSOLE_LINE_LEN ? len : CONSOLE_LINE_LEN;
+  memcpy(consoleBuf[consoleCount - 1], line, copyLen);
+  consoleBuf[consoleCount - 1][copyLen] = '\0';
+  consoleDirty = true;
+}
+
+// Live view of the raw NMEA stream, most recent line at the bottom.
+static void drawConsoleView() {
+  clearContentArea();
+
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_GREEN);
+  int16_t y = 36;
+  for (uint8_t i = 0; i < consoleCount; i++) {
+    tft.setCursor(8, y);
+    tft.print(consoleBuf[i]);
+    y += 15;
+  }
+
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(8, tft.height() - 14);
+  tft.print(consolePaused ? "PAUSED - click: resume, hold: back"
+                           : "Click: pause, hold: back");
+
+  prevOccupiedH = tft.height() - 32; // same leftover-clear reasoning as the detail view
 }
 
 static void removeRowAt(uint8_t idx) {
@@ -423,6 +627,10 @@ static void lockBaud() {
   uint32_t baud = BAUD_CANDIDATES[baudCandidateIdx];
   Serial.printf("Locked at %lu baud\n", (unsigned long)baud);
   rowCount = 0;
+  currentView = VIEW_LIST;
+  selectedRow = 0;
+  consoleCount = 0; // drop any lines buffered under the previous (wrong) rate
+  consolePaused = false;
   redrawAllRows();
   drawBaudBadge(baud);
 }
@@ -464,6 +672,7 @@ static void processLine(const char *line, uint8_t len) {
     if (rowCount >= MAX_SENSORS) return; // list full, ignore new categories for now
     idx = rowCount++;
     rows[idx].category = category;
+    rows[idx].typeCount = 0;
     // Don't resize/redraw right now: several sensors often show up within
     // the same second, and resizing after each one would visibly grow the
     // rows and shrink them back down repeatedly. Wait for a quiet moment.
@@ -472,23 +681,46 @@ static void processLine(const char *line, uint8_t len) {
   }
 
   rows[idx].lastSeen = millis();
+
+  bool grew = addTypeSilently(idx, type);
+  if (grew && currentView == VIEW_DETAIL && detailCategory == category) {
+    drawDetailView(idx);
+  }
 }
 
 // Drops any category that's gone quiet, so only currently-detected sensors stay listed.
+// Also prunes any individual sentence type that's gone quiet on a category
+// that's otherwise still active, and refreshes the detail screen if that's
+// the one currently open.
 static void refreshTimeouts() {
   uint32_t now = millis();
   bool removedAny = false;
+  bool detailClosed = false;
   for (uint8_t i = 0; i < rowCount; ) {
     if (now - rows[i].lastSeen >= SENSOR_TIMEOUT_MS) {
+      if (currentView == VIEW_DETAIL && detailCategory == rows[i].category) {
+        currentView = VIEW_LIST; // the sensor being viewed just disappeared
+        detailClosed = true;
+      }
       removeRowAt(i);
       removedAny = true;
     } else {
+      if (pruneStaleTypes(i) && currentView == VIEW_DETAIL && detailCategory == rows[i].category) {
+        drawDetailView(i);
+      }
       i++;
     }
   }
   if (removedAny) {
     layoutPending = true;
     lastRowSetChangeMs = now;
+    if (detailClosed) {
+      // The screen is currently showing the now-stale detail view we just
+      // backed out of — replace it right away instead of waiting out the
+      // usual settle delay, which would otherwise leave it frozen on screen.
+      layoutPending = false;
+      redrawAllRows();
+    }
   }
 }
 
@@ -502,6 +734,89 @@ static void checkLayoutSettle() {
   }
 }
 
+// Short click: from the list, opens the detail screen for the highlighted
+// row; from the console, toggles pause (frozen for reading, but still
+// buffering underneath) instead of leaving; from the detail screen, goes
+// back to the list.
+static void onEncoderClick() {
+  if (currentView == VIEW_LIST) {
+    if (rowCount == 0) return;
+    if (selectedRow >= rowCount) selectedRow = rowCount - 1;
+    detailCategory = rows[selectedRow].category;
+    currentView = VIEW_DETAIL;
+    drawDetailView(selectedRow);
+  } else if (currentView == VIEW_CONSOLE) {
+    consolePaused = !consolePaused;
+    drawConsoleView();
+  } else {
+    currentView = VIEW_LIST;
+    redrawAllRows();
+  }
+}
+
+// Long press toggles the console from the list (open) or from the console
+// itself (close, back to the list). Does nothing from the detail screen.
+static void onEncoderLongPress() {
+  if (currentView == VIEW_LIST) {
+    currentView = VIEW_CONSOLE;
+    consolePaused = false;
+    drawConsoleView();
+  } else if (currentView == VIEW_CONSOLE) {
+    currentView = VIEW_LIST;
+    redrawAllRows();
+  }
+}
+
+// Applies pending encoder rotation to the list selection, and tracks the
+// click button's hold time to tell a short click from a long press.
+static void handleEncoder() {
+  noInterrupts();
+  int8_t delta = encDelta;
+  encDelta = 0;
+  interrupts();
+
+  // Typical KY-040 modules emit 4 quadrature edges per detent; accumulate
+  // and only move the selection once a full detent's worth has come in, so
+  // one physical click always means exactly one row of movement.
+  static int16_t encAccum = 0;
+  encAccum += delta;
+  const int16_t STEPS_PER_DETENT = 4;
+  int8_t steps = 0;
+  while (encAccum >= STEPS_PER_DETENT) { encAccum -= STEPS_PER_DETENT; steps++; }
+  while (encAccum <= -STEPS_PER_DETENT) { encAccum += STEPS_PER_DETENT; steps--; }
+
+  if (steps != 0 && currentView == VIEW_LIST && rowCount > 0) {
+    int16_t newSel = (int16_t)selectedRow + steps;
+    if (newSel < 0) newSel = 0;
+    if (newSel >= rowCount) newSel = rowCount - 1;
+    if (newSel != selectedRow) {
+      uint8_t old = selectedRow;
+      selectedRow = (uint8_t)newSel;
+      drawRow(old);
+      drawRow(selectedRow);
+    }
+  }
+
+  static bool swPressed = false;
+  static bool longPressFired = false;
+  static uint32_t swPressStartMs = 0;
+  bool pressed = (digitalRead(ENC_SW_PIN) == LOW);
+
+  if (pressed && !swPressed) {
+    swPressed = true;
+    longPressFired = false;
+    swPressStartMs = millis();
+  } else if (pressed && swPressed && !longPressFired && millis() - swPressStartMs >= LONG_PRESS_MS) {
+    longPressFired = true;
+    onEncoderLongPress();
+  } else if (!pressed && swPressed) {
+    swPressed = false;
+    if (!longPressFired && millis() - swPressStartMs > SW_DEBOUNCE_MS) {
+      onEncoderClick();
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
@@ -510,6 +825,13 @@ void setup() {
   Serial.printf("SCK=%d MOSI=%d CS=%d DC=%d RST=%d @ %lu Hz\n",
                 PIN_SCL, PIN_SDA, PIN_CS, PIN_DC, PIN_RST, (unsigned long)SPI_HZ);
   Serial.printf("GPS RX=%d TX=%d\n", GPS_RX_PIN, GPS_TX_PIN);
+  Serial.printf("Encoder CLK=%d DT=%d SW=%d\n", ENC_CLK_PIN, ENC_DT_PIN, ENC_SW_PIN);
+
+  pinMode(ENC_CLK_PIN, INPUT_PULLUP);
+  pinMode(ENC_DT_PIN, INPUT_PULLUP);
+  pinMode(ENC_SW_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_CLK_PIN), onEncoderChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_DT_PIN), onEncoderChange, CHANGE);
 
   // Remaps SPI through the GPIO matrix: works even if you're not on 18/23
   SPI.begin(PIN_SCL, PIN_MISO, PIN_SDA, PIN_CS);
@@ -533,11 +855,22 @@ void loop() {
   while (gpsSerial.available()) {
     char c = gpsSerial.read();
     if (c == '\n') {
+      Serial.write((const uint8_t *)lineBuf, lineLen); // raw passthrough, for viewing in a serial monitor
+      Serial.println();
+      pushConsoleLine(lineBuf, lineLen);
       processLine(lineBuf, lineLen);
       lineLen = 0;
     } else if (c != '\r') {
       if (lineLen < sizeof(lineBuf) - 1) lineBuf[lineLen++] = c;
     }
+  }
+
+  // Only redraw the console once per batch of lines, not once per line —
+  // several can arrive in the same pass through this loop. While paused,
+  // leave consoleDirty set so the view catches up in one redraw on resume.
+  if (consoleDirty && currentView == VIEW_CONSOLE && !consolePaused) {
+    consoleDirty = false;
+    drawConsoleView();
   }
 
   static uint32_t lastRefresh = 0;
@@ -547,6 +880,7 @@ void loop() {
   }
 
   checkLayoutSettle();
+  handleEncoder();
 
   // No valid-looking line in a while — either the bus went quiet or the
   // source's baud rate changed and it's all garbled now. Either way, re-scan.

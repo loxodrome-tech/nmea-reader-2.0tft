@@ -28,6 +28,12 @@ without needing a laptop or a Wi-Fi/web UI in the loop.
 - Landscape 320x240 display, laid out to fill the screen with however many
   sensors are present, with a debounced/stable layout (no flicker/jitter as
   sensors are discovered)
+- A rotary encoder scrolls a highlighted selection through the list. A short
+  click opens a detail screen for the selected sensor, showing every distinct
+  sentence type it's currently sending (each one drops off on its own a few
+  seconds after it stops arriving); click again to return. A long press (from
+  the list) opens a live on-screen console of the raw NMEA lines as they
+  arrive — click to pause/resume it, hold to go back.
 
 ---
 
@@ -37,6 +43,7 @@ without needing a laptop or a Wi-Fi/web UI in the loop.
 - 2.0" 7-pin SPI TFT, ST7789 driver, 240x320 panel (run in landscape)
 - NMEA source wired to UART2: RX on GPIO16, TX on GPIO17 (only needed if the
   source expects a request)
+- Rotary encoder (KY-040 style): CLK on GPIO32, DT on GPIO33, SW on GPIO4
 
 Pins and SPI speed are configurable via `build_flags` in `platformio.ini`.
 
